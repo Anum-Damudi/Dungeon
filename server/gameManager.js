@@ -35,6 +35,35 @@ const CHAT_CHANNELS = {
   GHOST: 'ghostChat'
 };
 
+const CHAT_CHANNEL_ALIASES = {
+  day: CHAT_CHANNELS.DAY,
+  dayChat: CHAT_CHANNELS.DAY,
+  mafia: CHAT_CHANNELS.MAFIA,
+  mafiaChat: CHAT_CHANNELS.MAFIA,
+  ghost: CHAT_CHANNELS.GHOST,
+  ghostChat: CHAT_CHANNELS.GHOST
+};
+
+const TASK_STATUSES = {
+  PENDING: 'pending',
+  IN_PROGRESS: 'in_progress',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+  EXPIRED: 'expired'
+};
+
+const TASK_COMPLETION = {
+  MODERATOR_VERIFY: 'moderator_verify',
+  NIGHT_ACTION: 'night_action',
+  TRIAL_SUCCESS: 'trial_success',
+  SURVIVE_NIGHT: 'survive_night',
+  CAST_VOTE: 'cast_vote'
+};
+
+const ASSIGNABLE_ROLES = [ROLES.CITIZEN, ROLES.MAFIA, ROLES.DOCTOR, ROLES.DETECTIVE];
+const OPEN_TASK_STATUSES = [TASK_STATUSES.PENDING, TASK_STATUSES.IN_PROGRESS];
+
 class GameManager {
   constructor() {
     // Map<roomCode, Room>
@@ -87,6 +116,24 @@ class GameManager {
    * Moderator creates the room, gets moderator role, does not play in player pool
    */
   createRoom(playerName, socketId = null) {
+    // Repeated clicks from the same connected socket reuse the existing lobby
+    // instead of spawning extra rooms.
+    if (socketId && this.socketToSession.has(socketId)) {
+      const existingToken = this.socketToSession.get(socketId);
+      const { room, player } = this.getRoomAndPlayer(existingToken);
+      if (room && player && player.isModerator && room.phase === PHASES.LOBBY) {
+        player.connected = true;
+        player.socketId = socketId;
+        return {
+          code: room.code,
+          roomCode: room.code,
+          sessionToken: existingToken,
+          player,
+          reused: true
+        };
+      }
+    }
+
     const cleanName = this.sanitizeText(playerName) || 'Moderator';
     const code = this.generateRoomCode();
     const sessionToken = uuidv4();
@@ -131,7 +178,8 @@ class GameManager {
       clues: new Map(),         // Map<detectiveSessionId, string>
       sharedClues: [],          // Array<{ from, to, clue, timestamp }>
       pendingRecruit: null,     // { targetId, offeredBy, timeout }
-      pendingMafiaDeathChoice: false
+      pendingMafiaDeathChoice: false,
+      tasks: new Map()          // Map<taskId, Task>
     };
 
     room.players.set(sessionToken, moderator);
@@ -145,6 +193,7 @@ class GameManager {
 
     return {
       code,
+      roomCode: code,
       sessionToken,
       player: moderator
     };
@@ -449,6 +498,24 @@ class GameManager {
       throw new Error('Dead players cannot perform night actions.');
     }
 
+    const actionAliases = {
+      'forge-shield': 'shield',
+      'share-clue': 'share-clue',
+      rest: 'rest',
+      skip: 'skip'
+    };
+    if (actionAliases[action]) {
+      action = actionAliases[action];
+    }
+    if (action === 'rest' || action === 'skip') {
+      this.logAction(room, 'NIGHT_ACTION_SKIPPED', `${player.name} chose to wait through the night.`, { playerId: player.id }, false);
+      this.broadcastRoomState(room);
+      return { success: true, skipped: true };
+    }
+    if (action === 'share-clue') {
+      return this.handleShareClue(sessionToken, targetId);
+    }
+
     let targetPlayer = null;
     if (targetId) {
       targetPlayer = room.players.get(targetId);
@@ -487,6 +554,8 @@ class GameManager {
           { doctor: player.name, target: targetPlayer.name },
           false
         );
+        this.markTasksInProgress(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
+        this.completeMatchingTasks(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
         return { success: true, action: 'save', trial };
       }
 
@@ -517,6 +586,8 @@ class GameManager {
           { mafia: player.name, target: targetPlayer.name },
           false
         );
+        this.markTasksInProgress(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
+        this.completeMatchingTasks(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
         return { success: true, action: 'kill', trial };
       }
 
@@ -540,6 +611,8 @@ class GameManager {
           { detective: player.name },
           false
         );
+        this.markTasksInProgress(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
+        this.completeMatchingTasks(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
         return { success: true, action: 'investigate', trial };
       }
 
@@ -561,6 +634,8 @@ class GameManager {
           { citizen: player.name },
           false
         );
+        this.markTasksInProgress(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
+        this.completeMatchingTasks(room, player.id, TASK_COMPLETION.NIGHT_ACTION);
         return { success: true, action: 'shield', trial };
       }
 
@@ -680,6 +755,12 @@ class GameManager {
         break;
     }
 
+    if (success) {
+      this.completeMatchingTasks(room, player.id, TASK_COMPLETION.TRIAL_SUCCESS);
+    } else {
+      this.failMatchingTasks(room, player.id, TASK_COMPLETION.TRIAL_SUCCESS, 'Trial failed.');
+    }
+
     this.checkNightCompletion(room);
     this.broadcastRoomState(room);
     return resultData;
@@ -779,6 +860,7 @@ class GameManager {
         } else {
           // Victim dies
           victim.alive = false;
+          this.failOpenTasksForPlayer(room, victim.id, 'Player was eliminated.');
           deathsThisNight.push(victim);
           const deathMsg = `${victim.name} was found slaughtered in the dungeon at dawn.`;
           announcements.push(deathMsg);
@@ -793,6 +875,7 @@ class GameManager {
       if (livingMafia.length > 0) {
         const unluckyMafia = livingMafia[Math.floor(Math.random() * livingMafia.length)];
         unluckyMafia.alive = false;
+        this.failOpenTasksForPlayer(room, unluckyMafia.id, 'Player was eliminated.');
         deathsThisNight.push(unluckyMafia);
         const suicideMsg = `A member of the dark order perished in the shadows after failing their forbidden ritual.`;
         announcements.push(suicideMsg);
@@ -824,6 +907,9 @@ class GameManager {
     // Transition to DAWN
     if (!gameOver) {
       room.phase = PHASES.DAWN;
+      Array.from(room.players.values())
+        .filter(p => p.alive && !p.isModerator)
+        .forEach(p => this.completeMatchingTasks(room, p.id, TASK_COMPLETION.SURVIVE_NIGHT));
       this.logAction(room, 'DAWN_ARRIVED', `Dawn of Day ${room.round} begins.`, { announcements }, true);
     }
 
@@ -1113,6 +1199,7 @@ class GameManager {
     );
     const allVoted = eligibleVoters.every(p => room.votes.has(p.id));
 
+    this.completeMatchingTasks(room, player.id, TASK_COMPLETION.CAST_VOTE);
     this.broadcastRoomState(room);
 
     if (allVoted) {
@@ -1158,6 +1245,7 @@ class GameManager {
       eliminatedPlayer = room.players.get(candidatesWithMax[0]);
       if (eliminatedPlayer && eliminatedPlayer.alive) {
         eliminatedPlayer.alive = false;
+        this.failOpenTasksForPlayer(room, eliminatedPlayer.id, 'Player was eliminated.');
         announcement = `${eliminatedPlayer.name} was sentenced to death with ${maxVotes} votes. Role revealed: ${eliminatedPlayer.role.toUpperCase()}!`;
         this.logAction(
           room,
@@ -1217,6 +1305,7 @@ class GameManager {
       room.winner = 'citizens';
       const msg = 'CITIZENS VICTORY! All members of the Mafia have been slain.';
       this.logAction(room, 'GAME_OVER', msg, { winner: 'citizens' }, true);
+      this.cancelOpenTasks(room, 'Game ended.');
       return true;
     }
 
@@ -1226,6 +1315,7 @@ class GameManager {
       room.winner = 'mafia';
       const msg = 'MAFIA VICTORY! The Mafia now equal or outnumber the helpless citizens.';
       this.logAction(room, 'GAME_OVER', msg, { winner: 'mafia' }, true);
+      this.cancelOpenTasks(room, 'Game ended.');
       return true;
     }
 
@@ -1243,6 +1333,8 @@ class GameManager {
   handleChatMessage(sessionToken, channel, rawText) {
     const { room, player } = this.getRoomAndPlayer(sessionToken);
     if (!room || !player) throw new Error('Invalid session token.');
+
+    channel = CHAT_CHANNEL_ALIASES[channel] || channel;
 
     const cleanText = this.sanitizeText(rawText);
     if (!cleanText) {
@@ -1392,6 +1484,7 @@ class GameManager {
 
         target.alive = false;
         target.connected = false;
+        this.failOpenTasksForPlayer(room, targetId, 'Player was kicked.');
         room.players.delete(targetId);
         this.sessions.delete(targetId);
 
@@ -1454,6 +1547,404 @@ class GameManager {
   }
 
   /**
+   * Ensure the session belongs to the moderator of this room.
+   */
+  requireModerator(sessionToken) {
+    const { room, player } = this.getRoomAndPlayer(sessionToken);
+    if (!room || !player) throw new Error('Invalid session token.');
+    if (!player.isModerator) {
+      throw new Error('Only the moderator of this room can perform that action.');
+    }
+    return { room, player };
+  }
+
+  serializeTask(task, room) {
+    const assignees = (task.assigneeIds || []).map(id => {
+      const p = room.players.get(id);
+      return {
+        id,
+        name: p ? p.name : 'Unknown',
+        role: p ? p.role : null
+      };
+    });
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      objective: task.objective,
+      completionCondition: task.completionCondition,
+      status: task.status,
+      assigneeIds: [...task.assigneeIds],
+      assignees,
+      assigneeRole: task.assigneeRole,
+      isPublic: !!task.isPublic,
+      deadline: task.deadline,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      resultNote: task.resultNote || null
+    };
+  }
+
+  expireDueTasks(room) {
+    if (!room.tasks) return;
+    const now = Date.now();
+    for (const task of room.tasks.values()) {
+      if (OPEN_TASK_STATUSES.includes(task.status) && task.deadline && task.deadline <= now) {
+        task.status = TASK_STATUSES.EXPIRED;
+        task.updatedAt = now;
+        task.resultNote = 'Deadline expired.';
+        this.logAction(room, 'TASK_EXPIRED', `Task "${task.title}" expired.`, { taskId: task.id }, false);
+      }
+    }
+  }
+
+  setTaskStatus(room, task, status, note = null, isPublicLog = false) {
+    task.status = status;
+    task.updatedAt = Date.now();
+    if (note) task.resultNote = this.sanitizeText(note) || note;
+    this.logAction(
+      room,
+      'TASK_STATUS',
+      `Task "${task.title}" is now ${status}${note ? ` (${note})` : ''}.`,
+      { taskId: task.id, status },
+      isPublicLog || !!task.isPublic
+    );
+  }
+
+  completeMatchingTasks(room, playerId, condition) {
+    if (!room.tasks) return;
+    this.expireDueTasks(room);
+    for (const task of room.tasks.values()) {
+      if (!OPEN_TASK_STATUSES.includes(task.status)) continue;
+      if (task.completionCondition !== condition) continue;
+      if (!task.assigneeIds.includes(playerId)) continue;
+      this.setTaskStatus(room, task, TASK_STATUSES.COMPLETED, 'Completion condition met.');
+    }
+  }
+
+  failMatchingTasks(room, playerId, condition, note) {
+    if (!room.tasks) return;
+    for (const task of room.tasks.values()) {
+      if (!OPEN_TASK_STATUSES.includes(task.status)) continue;
+      if (task.completionCondition !== condition) continue;
+      if (!task.assigneeIds.includes(playerId)) continue;
+      this.setTaskStatus(room, task, TASK_STATUSES.FAILED, note);
+    }
+  }
+
+  markTasksInProgress(room, playerId, condition) {
+    if (!room.tasks) return;
+    for (const task of room.tasks.values()) {
+      if (task.status !== TASK_STATUSES.PENDING) continue;
+      if (task.completionCondition !== condition) continue;
+      if (!task.assigneeIds.includes(playerId)) continue;
+      this.setTaskStatus(room, task, TASK_STATUSES.IN_PROGRESS);
+    }
+  }
+
+  failOpenTasksForPlayer(room, playerId, note) {
+    if (!room.tasks) return;
+    for (const task of room.tasks.values()) {
+      if (!OPEN_TASK_STATUSES.includes(task.status)) continue;
+      if (!task.assigneeIds.includes(playerId)) continue;
+      this.setTaskStatus(room, task, TASK_STATUSES.FAILED, note);
+    }
+  }
+
+  cancelOpenTasks(room, note) {
+    if (!room.tasks) return;
+    for (const task of room.tasks.values()) {
+      if (!OPEN_TASK_STATUSES.includes(task.status)) continue;
+      this.setTaskStatus(room, task, TASK_STATUSES.CANCELLED, note);
+    }
+  }
+
+  resolveTaskAssignees(room, payload) {
+    const assigneeIds = new Set();
+    let assigneeRole = null;
+
+    const targetId = payload.targetId || payload.playerId;
+    if (targetId) {
+      const target = room.players.get(targetId);
+      if (!target || target.isModerator) {
+        throw new Error('Target player is not eligible for a task.');
+      }
+      assigneeIds.add(target.id);
+    }
+
+    if (payload.assigneeIds && Array.isArray(payload.assigneeIds)) {
+      payload.assigneeIds.forEach(id => {
+        const target = room.players.get(id);
+        if (target && !target.isModerator) assigneeIds.add(target.id);
+      });
+    }
+
+    if (payload.role) {
+      const role = String(payload.role).toLowerCase();
+      if (!ASSIGNABLE_ROLES.includes(role)) {
+        throw new Error('Tasks can only be assigned to citizen, mafia, doctor, or detective.');
+      }
+      if (room.phase === PHASES.LOBBY) {
+        throw new Error('Roles have not been assigned yet. Assign the task to a specific player, or start the ritual first.');
+      }
+      assigneeRole = role;
+      Array.from(room.players.values())
+        .filter(p => !p.isModerator && p.role === role)
+        .forEach(p => assigneeIds.add(p.id));
+    }
+
+    if (assigneeIds.size === 0) {
+      throw new Error('Select a player or an eligible role to receive the task.');
+    }
+
+    return { assigneeIds: Array.from(assigneeIds), assigneeRole };
+  }
+
+  /**
+   * Moderator assigns a task to a player or all living members of a role.
+   */
+  handleAssignTask(sessionToken, payload = {}) {
+    const { room, player } = this.requireModerator(sessionToken);
+    this.expireDueTasks(room);
+
+    const title = this.sanitizeText(payload.title);
+    const description = this.sanitizeText(payload.description);
+    const objective = this.sanitizeText(payload.objective) || description;
+    if (!title) throw new Error('A task title is required.');
+    if (!description) throw new Error('A task description is required.');
+
+    const completionCondition = payload.completionCondition || TASK_COMPLETION.MODERATOR_VERIFY;
+    if (!Object.values(TASK_COMPLETION).includes(completionCondition)) {
+      throw new Error('Invalid task completion condition.');
+    }
+
+    const { assigneeIds, assigneeRole } = this.resolveTaskAssignees(room, payload);
+
+    let deadline = null;
+    if (payload.deadline) {
+      deadline = Number(payload.deadline);
+    } else if (payload.timeLimitSeconds) {
+      deadline = Date.now() + Number(payload.timeLimitSeconds) * 1000;
+    }
+    if (deadline !== null && (!Number.isFinite(deadline) || deadline <= Date.now())) {
+      throw new Error('Task deadline must be in the future.');
+    }
+
+    const task = {
+      id: uuidv4(),
+      title,
+      description,
+      objective,
+      completionCondition,
+      status: TASK_STATUSES.PENDING,
+      assigneeIds,
+      assigneeRole,
+      isPublic: !!payload.isPublic,
+      deadline,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      createdBy: player.id,
+      resultNote: null
+    };
+
+    room.tasks.set(task.id, task);
+    const names = assigneeIds.map(id => room.players.get(id).name).join(', ');
+    this.logAction(
+      room,
+      'TASK_ASSIGNED',
+      `Moderator assigned "${title}" to ${names}.`,
+      { taskId: task.id, assigneeIds, assigneeRole },
+      !!task.isPublic
+    );
+
+    this.broadcastRoomState(room);
+    if (this.io) {
+      assigneeIds.forEach(id => {
+        const target = room.players.get(id);
+        if (target && target.connected && target.socketId) {
+          this.io.to(target.socketId).emit('task-assigned', this.serializeTask(task, room));
+        }
+      });
+      if (player.socketId) {
+        this.io.to(player.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
+      }
+    }
+
+    return { success: true, task: this.serializeTask(task, room) };
+  }
+
+  handleUpdateTask(sessionToken, payload = {}) {
+    const { room } = this.requireModerator(sessionToken);
+    this.expireDueTasks(room);
+    const task = room.tasks.get(payload.taskId);
+    if (!task) throw new Error('Task not found.');
+    if (!OPEN_TASK_STATUSES.includes(task.status) && payload.status && OPEN_TASK_STATUSES.includes(payload.status)) {
+      throw new Error('Closed tasks cannot be reopened.');
+    }
+
+    if (payload.title) task.title = this.sanitizeText(payload.title) || task.title;
+    if (payload.description) task.description = this.sanitizeText(payload.description) || task.description;
+    if (payload.objective) task.objective = this.sanitizeText(payload.objective) || task.objective;
+    if (payload.isPublic !== undefined) task.isPublic = !!payload.isPublic;
+    if (payload.deadline !== undefined) {
+      task.deadline = payload.deadline ? Number(payload.deadline) : null;
+    }
+    if (payload.completionCondition && Object.values(TASK_COMPLETION).includes(payload.completionCondition)) {
+      task.completionCondition = payload.completionCondition;
+    }
+    task.updatedAt = Date.now();
+
+    this.logAction(room, 'TASK_UPDATED', `Moderator updated task "${task.title}".`, { taskId: task.id }, false);
+    this.broadcastRoomState(room);
+    return { success: true, task: this.serializeTask(task, room) };
+  }
+
+  handleCancelTask(sessionToken, payload = {}) {
+    const { room, player } = this.requireModerator(sessionToken);
+    const task = room.tasks.get(payload.taskId);
+    if (!task) throw new Error('Task not found.');
+    if (!OPEN_TASK_STATUSES.includes(task.status)) {
+      throw new Error('Only pending or in-progress tasks can be cancelled.');
+    }
+    this.setTaskStatus(room, task, TASK_STATUSES.CANCELLED, payload.note || 'Cancelled by moderator.');
+    this.broadcastRoomState(room);
+    if (this.io && player.socketId) {
+      this.io.to(player.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
+    }
+    return { success: true, task: this.serializeTask(task, room) };
+  }
+
+  handleVerifyTask(sessionToken, payload = {}) {
+    const { room, player } = this.requireModerator(sessionToken);
+    const task = room.tasks.get(payload.taskId);
+    if (!task) throw new Error('Task not found.');
+    if (!OPEN_TASK_STATUSES.includes(task.status)) {
+      throw new Error('This task is no longer open.');
+    }
+    const outcome = payload.outcome === TASK_STATUSES.FAILED ? TASK_STATUSES.FAILED : TASK_STATUSES.COMPLETED;
+    this.setTaskStatus(room, task, outcome, payload.note || 'Verified by moderator.');
+    this.broadcastRoomState(room);
+    if (this.io && player.socketId) {
+      this.io.to(player.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
+    }
+    return { success: true, task: this.serializeTask(task, room) };
+  }
+
+  /**
+   * Players cannot self-complete moderator-verified tasks. Other conditions
+   * are completed only by matching server-side game events.
+   */
+  handlePlayerTaskComplete(sessionToken, payload = {}) {
+    const { room, player } = this.getRoomAndPlayer(sessionToken);
+    if (!room || !player) throw new Error('Invalid session token.');
+    const task = room.tasks.get(payload && payload.taskId);
+    if (!task) throw new Error('Task not found.');
+    if (!task.assigneeIds.includes(player.id)) {
+      throw new Error('You are not assigned to this task.');
+    }
+    throw new Error('Tasks cannot be marked complete from the client. The moderator or a matching game event must confirm completion.');
+  }
+
+  getVisibleTasks(room, player) {
+    if (!room.tasks) return [];
+    this.expireDueTasks(room);
+    const list = [];
+    for (const task of room.tasks.values()) {
+      const isAssignee = task.assigneeIds.includes(player.id);
+      if (player.isModerator || isAssignee || task.isPublic) {
+        const serialized = this.serializeTask(task, room);
+        if (!player.isModerator && !task.isPublic) {
+          serialized.assignees = serialized.assignees.filter(a => a.id === player.id);
+          serialized.assignees.forEach(a => { a.role = player.role; });
+        }
+        if (!player.isModerator && !isAssignee && task.isPublic) {
+          serialized.assignees = serialized.assignees.map(a => ({ id: a.id, name: a.name, role: null }));
+        }
+        list.push(serialized);
+      }
+    }
+    return list.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  getPlayerNightStatus(room, player) {
+    if (player.isModerator) {
+      return { action: 'none', actionSubmitted: true, trial: 'n/a', label: 'Observing' };
+    }
+    if (room.phase !== PHASES.NIGHT && room.phase !== PHASES.NIGHT_RESOLUTION) {
+      const voted = room.votes.has(player.id);
+      return {
+        action: room.phase === PHASES.VOTING ? (voted ? 'voted' : 'pending_vote') : 'none',
+        actionSubmitted: room.phase === PHASES.VOTING ? voted : null,
+        trial: 'n/a',
+        label: room.phase === PHASES.VOTING ? (voted ? 'Vote cast' : 'Awaiting vote') : '—'
+      };
+    }
+
+    const trialState = (record) => {
+      if (!record) return { actionSubmitted: false, trial: 'pending', label: 'Awaiting action' };
+      if (!record.trialCompleted) return { actionSubmitted: true, trial: 'in_progress', label: 'Trial in progress' };
+      if (record.success) return { actionSubmitted: true, trial: 'completed', label: 'Trial succeeded' };
+      return { actionSubmitted: true, trial: 'failed', label: 'Trial failed' };
+    };
+
+    if (player.role === ROLES.DOCTOR) return { action: 'save', ...trialState(room.nightActions.doctorSave) };
+    if (player.role === ROLES.MAFIA) return { action: 'kill', ...trialState(room.nightActions.mafiaKill) };
+    if (player.role === ROLES.DETECTIVE) return { action: 'investigate', ...trialState(room.nightActions.detectiveClue) };
+    if (player.role === ROLES.CITIZEN) {
+      const attempt = room.nightActions.shieldAttempts.get(player.id);
+      if (!attempt) return { action: 'shield', actionSubmitted: false, trial: 'optional', label: 'Optional shield' };
+      return { action: 'shield', ...trialState(attempt) };
+    }
+    return { action: 'none', actionSubmitted: false, trial: 'n/a', label: '—' };
+  }
+
+  buildModeratorDashboard(room) {
+    this.expireDueTasks(room);
+    const players = Array.from(room.players.values()).map(p => {
+      const night = this.getPlayerNightStatus(room, p);
+      const connection = p.connected ? 'connected' : 'disconnected';
+      let life = 'alive';
+      if (!p.alive) life = 'eliminated';
+      const playerTasks = Array.from(room.tasks.values())
+        .filter(t => t.assigneeIds.includes(p.id))
+        .map(t => ({ id: t.id, title: t.title, status: t.status }));
+      return {
+        id: p.id,
+        name: p.name,
+        role: p.role,
+        alive: p.alive,
+        connected: p.connected,
+        status: p.isModerator ? 'moderator' : `${life}/${connection}`,
+        isModerator: p.isModerator,
+        isButterfly: room.butterflies.has(p.id),
+        hasShield: p.hasShield,
+        envelopeOpened: p.envelopeOpened,
+        rulesAcknowledged: p.rulesAcknowledged,
+        actionSubmitted: night.actionSubmitted,
+        trialStatus: night.trial,
+        activityLabel: night.label,
+        tasks: playerTasks
+      };
+    });
+
+    return {
+      roomCode: room.code,
+      phase: room.phase,
+      round: room.round,
+      paused: room.paused,
+      winner: room.winner,
+      players,
+      tasks: Array.from(room.tasks.values()).map(t => this.serializeTask(t, room)),
+      actionLog: room.actionLog.slice(-100)
+    };
+  }
+
+  getModeratorDashboard(sessionToken) {
+    const { room } = this.requireModerator(sessionToken);
+    return this.buildModeratorDashboard(room);
+  }
+
+  /**
    * Record action in room's live actionLog
    */
   logAction(room, type, text, details = {}, isPublic = false) {
@@ -1470,11 +1961,12 @@ class GameManager {
 
     room.actionLog.push(entry);
 
-    // Send real-time ledger update to moderator
+    // Send real-time ledger update to moderator only
     if (this.io) {
       const moderator = Array.from(room.players.values()).find(p => p.isModerator);
       if (moderator && moderator.connected && moderator.socketId) {
         this.io.to(moderator.socketId).emit('ledger-update', entry);
+        this.io.to(moderator.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
       }
     }
 
@@ -1570,6 +2062,7 @@ class GameManager {
     const { room, player } = this.getRoomAndPlayer(sessionToken);
     if (!room || !player) return null;
 
+    this.expireDueTasks(room);
     const isMod = player.isModerator;
     const isGameOver = room.phase === PHASES.GAME_OVER;
 
@@ -1650,6 +2143,8 @@ class GameManager {
         ghost: filteredGhostChat
       },
       moderatorLedger: isMod ? room.actionLog : undefined,
+      moderatorDashboard: isMod ? this.buildModeratorDashboard(room) : undefined,
+      tasks: this.getVisibleTasks(room, player),
       pendingMafiaDeathChoice: (player.role === ROLES.MAFIA && room.pendingMafiaDeathChoice) || false,
       pendingRecruit: (room.pendingRecruit && room.pendingRecruit.targetId === player.id) || false
     };
@@ -1690,5 +2185,7 @@ gameManager.GameManager = GameManager;
 gameManager.ROLES = ROLES;
 gameManager.PHASES = PHASES;
 gameManager.CHAT_CHANNELS = CHAT_CHANNELS;
+gameManager.TASK_STATUSES = TASK_STATUSES;
+gameManager.TASK_COMPLETION = TASK_COMPLETION;
 
 module.exports = gameManager;

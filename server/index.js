@@ -79,9 +79,18 @@ io.on('connection', (socket) => {
       const result = gameManager.createRoom(playerName, socket.id);
       socket.join(result.code);
       const state = gameManager.getPlayerState(result.sessionToken);
-      socket.emit('room-created', { code: result.code, sessionToken: result.sessionToken, state });
+      const createdPayload = {
+        code: result.code,
+        roomCode: result.code,
+        sessionToken: result.sessionToken,
+        playerId: result.sessionToken,
+        players: state.players,
+        state,
+        reused: !!result.reused
+      };
+      socket.emit('room-created', createdPayload);
       socket.emit('game-state', state);
-      handleResponse(callback, null, { code: result.code, sessionToken: result.sessionToken, state });
+      handleResponse(callback, null, createdPayload);
       console.log(`[Room] Created room ${result.code} by ${playerName}`);
     } catch (err) {
       handleResponse(callback, err);
@@ -96,9 +105,11 @@ io.on('connection', (socket) => {
       const result = gameManager.joinRoom(code, playerName, socket.id);
       socket.join(code.toUpperCase().trim());
       const state = gameManager.getPlayerState(result.sessionToken);
-      socket.emit('room-joined', { sessionToken: result.sessionToken, state });
+      const joinedPayload = { sessionToken: result.sessionToken, playerId: result.sessionToken, roomCode: code.toUpperCase().trim(), state };
+      socket.emit('room-joined', joinedPayload);
+      socket.emit('player-joined', { ...joinedPayload, players: state.players, player: state.me });
       socket.emit('game-state', state);
-      handleResponse(callback, null, { sessionToken: result.sessionToken, state });
+      handleResponse(callback, null, joinedPayload);
       console.log(`[Room] Player ${playerName} joined room ${code}`);
     } catch (err) {
       handleResponse(callback, err);
@@ -182,7 +193,7 @@ io.on('connection', (socket) => {
     try {
       const sessionToken = resolveToken(payload);
       const channel = payload && payload.channel;
-      const text = payload && payload.text;
+      const text = payload && (payload.text || payload.message);
       const result = gameManager.handleChatMessage(sessionToken, channel, text);
       handleResponse(callback, null, result);
     } catch (err) {
@@ -234,6 +245,107 @@ io.on('connection', (socket) => {
       const action = payload && payload.action;
       const targetId = payload && payload.targetId;
       const result = gameManager.handleModeratorAction(sessionToken, action, targetId);
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  // --- 13b. Task assignment (moderator-only; authorized in GameManager) ---
+  socket.on('assign-task', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handleAssignTask(sessionToken, payload || {});
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('update-task', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handleUpdateTask(sessionToken, payload || {});
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('cancel-task', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handleCancelTask(sessionToken, payload || {});
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('verify-task', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handleVerifyTask(sessionToken, payload || {});
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('complete-task', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handlePlayerTaskComplete(sessionToken, payload || {});
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('request-moderator-dashboard', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const dashboard = gameManager.getModeratorDashboard(sessionToken);
+      socket.emit('moderator-update', dashboard);
+      handleResponse(callback, null, { dashboard });
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  // Client aliases — existing moderator-action / recruit events remain authoritative
+  const aliasModerator = (eventName, action, targetKey) => {
+    socket.on(eventName, (payload, callback) => {
+      try {
+        const sessionToken = resolveToken(payload);
+        const targetId = payload && (payload[targetKey] || payload.targetId);
+        const result = gameManager.handleModeratorAction(sessionToken, action, targetId);
+        handleResponse(callback, null, result);
+      } catch (err) {
+        handleResponse(callback, err);
+      }
+    });
+  };
+  aliasModerator('moderator-advance-phase', 'advance-phase');
+  aliasModerator('moderator-close-votes', 'close-votes');
+  aliasModerator('moderator-pause', 'pause');
+  aliasModerator('moderator-kick', 'kick-player', 'playerId');
+
+  socket.on('recruit-response', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const result = gameManager.handleMafiaRecruitResponse(sessionToken, payload && payload.accept);
+      handleResponse(callback, null, result);
+    } catch (err) {
+      handleResponse(callback, err);
+    }
+  });
+
+  socket.on('mafia-death-choice-response', (payload, callback) => {
+    try {
+      const sessionToken = resolveToken(payload);
+      const action = payload && (payload.action || payload.choice);
+      const result = gameManager.handleMafiaChooseAction(sessionToken, action, payload && payload.targetId);
       handleResponse(callback, null, result);
     } catch (err) {
       handleResponse(callback, err);

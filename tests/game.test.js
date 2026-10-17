@@ -880,4 +880,131 @@ describe('DUNGEON Game Logic Test Suite', () => {
       }).toThrow(/too quickly/);
     });
   });
+
+  // =========================================================================
+  // 9. TASK ASSIGNMENT & MODERATOR TOME SUITE
+  // =========================================================================
+  describe('Task Assignment System', () => {
+    test('Moderator can assign a charge to a specific player', () => {
+      const { gm, modData, players, room } = setupGame(5);
+      const targetPlayer = players[0];
+
+      const res = gm.handleAssignTask(modData.sessionToken, {
+        targetId: targetPlayer.sessionToken,
+        title: 'Gather herbs in the dungeon garden',
+        description: 'Collect 3 moonflowers before the nocturnal bell tolls.',
+        completionCondition: 'moderator_verify'
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.task.title).toBe('Gather herbs in the dungeon garden');
+      expect(res.task.assigneeIds).toContain(targetPlayer.sessionToken);
+      expect(res.task.status).toBe('pending');
+      expect(room.tasks.has(res.task.id)).toBe(true);
+    });
+
+    test('Moderator can assign a charge to an eligible role', () => {
+      const { gm, modData, room } = setupGame(5);
+      const res = gm.handleAssignTask(modData.sessionToken, {
+        role: 'mafia',
+        title: 'Cabal ritual',
+        description: 'Coordinate in the shadows.',
+        completionCondition: 'moderator_verify'
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.task.assigneeRole).toBe('mafia');
+      const mafiaPlayer = Array.from(room.players.values()).find(p => p.role === ROLES.MAFIA);
+      expect(res.task.assigneeIds).toContain(mafiaPlayer.id);
+    });
+
+    test('Non-moderator cannot assign a charge', () => {
+      const { gm, players } = setupGame(5);
+      expect(() => {
+        gm.handleAssignTask(players[0].sessionToken, {
+          targetId: players[1].sessionToken,
+          title: 'Illegal task',
+          description: 'Citizens cannot command souls.'
+        });
+      }).toThrow('Only the moderator');
+    });
+
+    test('Moderator can verify task as completed or failed', () => {
+      const { gm, modData, players } = setupGame(5);
+      const created = gm.handleAssignTask(modData.sessionToken, {
+        targetId: players[0].sessionToken,
+        title: 'Trial of Valor',
+        description: 'Survive the crypt test.',
+        completionCondition: 'moderator_verify'
+      });
+
+      const verifyRes = gm.handleVerifyTask(modData.sessionToken, {
+        taskId: created.task.id,
+        outcome: 'completed',
+        note: 'Bravely completed.'
+      });
+
+      expect(verifyRes.success).toBe(true);
+      expect(verifyRes.task.status).toBe('completed');
+      expect(verifyRes.task.resultNote).toBe('Bravely completed.');
+    });
+
+    test('Moderator can cancel an open task', () => {
+      const { gm, modData, players } = setupGame(5);
+      const created = gm.handleAssignTask(modData.sessionToken, {
+        targetId: players[0].sessionToken,
+        title: 'Scout the ramparts',
+        description: 'Search for shadows.',
+        completionCondition: 'moderator_verify'
+      });
+
+      const cancelRes = gm.handleCancelTask(modData.sessionToken, {
+        taskId: created.task.id,
+        note: 'Order rescinded.'
+      });
+
+      expect(cancelRes.success).toBe(true);
+      expect(cancelRes.task.status).toBe('cancelled');
+    });
+
+    test('Assigned player sees task in their player state', () => {
+      const { gm, modData, players } = setupGame(5);
+      const target = players[0];
+      const other = players[1];
+
+      gm.handleAssignTask(modData.sessionToken, {
+        targetId: target.sessionToken,
+        title: 'Private Mission',
+        description: 'Secret mission for you alone.',
+        isPublic: false
+      });
+
+      const targetState = gm.getPlayerState(target.sessionToken);
+      const otherState = gm.getPlayerState(other.sessionToken);
+
+      expect(targetState.tasks.length).toBe(1);
+      expect(targetState.tasks[0].title).toBe('Private Mission');
+      expect(otherState.tasks.length).toBe(0);
+    });
+
+    test('Public task is visible to all players', () => {
+      const { gm, modData, players } = setupGame(5);
+      const target = players[0];
+      const other = players[1];
+
+      gm.handleAssignTask(modData.sessionToken, {
+        targetId: target.sessionToken,
+        title: 'Grand Decree',
+        description: 'Everyone may observe this deed.',
+        isPublic: true
+      });
+
+      const targetState = gm.getPlayerState(target.sessionToken);
+      const otherState = gm.getPlayerState(other.sessionToken);
+
+      expect(targetState.tasks.length).toBe(1);
+      expect(otherState.tasks.length).toBe(1);
+      expect(otherState.tasks[0].title).toBe('Grand Decree');
+    });
+  });
 });

@@ -42,6 +42,7 @@
       <p class="phase-subtitle">You shall be the Moderator — the all-seeing eye.</p>
       <input type="text" id="input-name-create" class="input-name" placeholder="Your Name (Moderator)" maxlength="20" aria-label="Moderator name">
       <button id="btn-create-confirm" class="btn btn-primary" type="button">Summon the Portal</button>
+      <p id="create-status" class="status-text" role="status"></p>
       <button id="btn-back-entry" class="btn btn-secondary" type="button">Back</button>
     </div>
   </section>
@@ -60,6 +61,7 @@
         <ul id="player-list" class="player-list" role="list"></ul>
       </div>
       <button id="btn-start" class="btn btn-primary" style="display:none;" type="button">Begin the Ritual</button>
+      <button id="btn-open-tome" class="btn btn-secondary" style="display:none;" type="button">Open Moderator's Tome</button>
       <p id="lobby-status" class="status-text"></p>
     </div>
   </section>
@@ -181,12 +183,14 @@
     <div class="moderator-content">
       <div class="mod-header">
         <h2>Moderator's Tome</h2>
+        <span id="mod-room-code" class="room-code room-code-inline"></span>
         <span id="mod-phase-badge" class="phase-badge"></span>
       </div>
       <div class="mod-controls">
         <button id="btn-mod-advance" class="btn btn-secondary" type="button">Advance Phase</button>
         <button id="btn-mod-close-votes" class="btn btn-secondary" style="display:none;" type="button">Close Votes</button>
         <button id="btn-mod-pause" class="btn btn-secondary" type="button">Pause</button>
+        <button id="btn-mod-back-lobby" class="btn btn-secondary" type="button">Return to Portal</button>
       </div>
       <div class="mod-grid">
         <div class="mod-players-section">
@@ -194,9 +198,47 @@
           <div id="mod-players" class="mod-players"></div>
         </div>
         <div class="mod-ledger-section">
-          <h3>Action Ledger</h3>
+          <h3>Activity Chronicle</h3>
           <div id="mod-action-log" class="action-log"></div>
         </div>
+      </div>
+      <div class="mod-tasks-section">
+        <h3>Assign a Charge</h3>
+        <form id="mod-task-form" class="mod-task-form">
+          <div class="mod-task-row">
+            <label for="mod-task-player">Soul</label>
+            <select id="mod-task-player">
+              <option value="">— Specific player —</option>
+            </select>
+            <label for="mod-task-role">or Role</label>
+            <select id="mod-task-role">
+              <option value="">— Eligible role —</option>
+              <option value="citizen">Citizen</option>
+              <option value="mafia">Mafia</option>
+              <option value="doctor">Doctor</option>
+              <option value="detective">Detective</option>
+            </select>
+          </div>
+          <input type="text" id="mod-task-title" maxlength="80" placeholder="Task title" aria-label="Task title">
+          <textarea id="mod-task-description" maxlength="400" rows="2" placeholder="Description and objective" aria-label="Task description"></textarea>
+          <div class="mod-task-row">
+            <label for="mod-task-condition">Completion</label>
+            <select id="mod-task-condition">
+              <option value="moderator_verify">Moderator verifies</option>
+              <option value="night_action">Complete night action</option>
+              <option value="trial_success">Succeed at a trial</option>
+              <option value="survive_night">Survive the night</option>
+              <option value="cast_vote">Cast a tribunal vote</option>
+            </select>
+            <label for="mod-task-limit">Limit (sec)</label>
+            <input type="number" id="mod-task-limit" min="0" max="3600" placeholder="optional" aria-label="Time limit in seconds">
+            <label class="mod-task-public">
+              <input type="checkbox" id="mod-task-public"> Public
+            </label>
+          </div>
+          <button id="btn-mod-assign-task" class="btn btn-primary" type="submit">Inscribe Task</button>
+        </form>
+        <div id="mod-task-list" class="mod-task-list"></div>
       </div>
       <div class="mod-kick">
         <label for="mod-kick-select" class="sr-only">Select player to kick</label>
@@ -207,6 +249,12 @@
       </div>
     </div>
   </section>
+
+  <!-- Player task panel -->
+  <div id="task-panel" class="task-panel" style="display:none;" role="complementary" aria-label="Assigned tasks">
+    <h3>Your Charges</h3>
+    <div id="player-task-list" class="player-task-list"></div>
+  </div>
 
   <!-- ============ Chat Panel (collapsible) ============ -->
   <div id="chat-panel" class="chat-panel" style="display:none;" role="complementary" aria-label="Chat">

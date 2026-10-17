@@ -6,12 +6,35 @@
 (function () {
   'use strict';
 
+  // Clear any legacy localStorage session from previous single-session builds
+  try {
+    localStorage.removeItem('dungeon-session');
+    localStorage.removeItem('dungeon-room');
+  } catch (e) {}
+
+  // Check URL parameters for room code
+  let urlRoomCode = null;
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    const codeFromUrl = urlParams.get('code');
+    if (codeFromUrl) {
+      urlRoomCode = codeFromUrl.trim().toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
+    }
+  } catch (e) {}
+
+  // If visiting an invite link for a different room, clear old tab session
+  const storedRoom = sessionStorage.getItem('dungeon-room');
+  if (urlRoomCode && storedRoom && storedRoom !== urlRoomCode) {
+    sessionStorage.removeItem('dungeon-session');
+    sessionStorage.removeItem('dungeon-room');
+  }
+
   // =========================================================================
   // 1. GAME STATE
   // =========================================================================
   const state = {
-    sessionToken: localStorage.getItem('dungeon-session') || null,
-    roomCode: null,
+    sessionToken: sessionStorage.getItem('dungeon-session') || null,
+    roomCode: sessionStorage.getItem('dungeon-room') || urlRoomCode || null,
     playerName: null,
     playerId: null,
     role: null,
@@ -37,7 +60,20 @@
       ghost: [],
       mafia: []
     },
-    actionLedger: []
+    actionLedger: [],
+    tasks: [],
+    moderatorDashboard: null,
+    createRoomPending: false
+  };
+
+  const CHANNEL_TO_SERVER = { day: 'dayChat', mafia: 'mafiaChat', ghost: 'ghostChat' };
+  const CHANNEL_FROM_SERVER = {
+    dayChat: 'day',
+    mafiaChat: 'mafia',
+    ghostChat: 'ghost',
+    day: 'day',
+    mafia: 'mafia',
+    ghost: 'ghost'
   };
 
   // 12 sacred rules of DUNGEON (Exact laws)
@@ -75,7 +111,9 @@
   // =========================================================================
   const socket = typeof io === 'function'
     ? io({
-        auth: { sessionToken: state.sessionToken },
+        auth: (cb) => {
+          cb({ sessionToken: state.sessionToken });
+        },
         transports: ['websocket', 'polling']
       })
     : {
@@ -104,6 +142,206 @@
         window.destroyPortal();
       }
     }
+  }
+
+  function emitAck(event, payload, onSuccess) {
+    const body = Object.assign({ sessionToken: state.sessionToken }, payload || {});
+    socket.emit(event, body, (res) => {
+      if (!res || res.success === false) {
+        const msg = (res && (res.error || res.message)) || 'The dungeon rejected that request.';
+        showToast(msg, 3500);
+        return;
+      }
+      if (typeof onSuccess === 'function') onSuccess(res);
+    });
+  }
+
+  function normalizeRole(role) {
+    return role ? String(role).toUpperCase() : null;
+  }
+
+  function mapPlayers(list) {
+    return (list || []).map(p => ({
+      ...p,
+      role: p.role ? String(p.role).toUpperCase() : p.role,
+      isAlive: p.isAlive !== undefined ? p.isAlive : p.alive !== false
+    }));
+  }
+
+  function applyCreatedRoom(data) {
+    const code = data.roomCode || data.code || (data.state && data.state.roomCode);
+    if (!code) {
+      setCreateStatus(false, 'The portal opened, but no room code was returned.');
+      showToast('Room creation failed: missing room code.');
+      return false;
+    }
+    state.roomCode = code;
+    try {
+      window.history.replaceState(null, '', `?code=${code}`);
+    } catch (e) {}
+    state.sessionToken = data.sessionToken || state.sessionToken;
+    state.isModerator = true;
+    state.playerId = data.playerId || (data.state && data.state.me && data.state.me.id) || state.sessionToken;
+    if (state.sessionToken) {
+      sessionStorage.setItem('dungeon-session', state.sessionToken);
+      sessionStorage.setItem('dungeon-room', code);
+      if (socket) {
+        socket.auth = { sessionToken: state.sessionToken };
+      }
+    }
+    if (data.state) {
+      applyServerState(data.state);
+    } else {
+      state.players = mapPlayers(data.players) || [{ name: state.playerName, id: state.playerId, isModerator: true, isAlive: true }];
+      updateLobbyUI();
+    }
+    const chatPanel = document.getElementById('chat-panel');
+    if (chatPanel) chatPanel.style.display = 'block';
+    showScreen('screen-lobby');
+    showToast(`Dungeon room created: ${code}`);
+    return true;
+  }
+
+  function setCreateStatus(isLoading, errorMsg) {
+    const btn = document.getElementById('btn-create-confirm');
+    const status = document.getElementById('create-status');
+    if (btn) {
+      btn.disabled = !!isLoading;
+      btn.textContent = isLoading ? 'Opening the portal...' : 'Summon the Portal';
+    }
+    if (status) {
+      status.textContent = errorMsg || (isLoading ? 'Inscribing a unique room sigil...' : '');
+      status.classList.toggle('error', !!errorMsg);
+    }
+  }
+
+  function applyServerState(serverState, extra) {
+    extra = extra || {};
+    if (!serverState) return;
+
+    if (serverState.roomCode) {
+      state.roomCode = serverState.roomCode;
+      try {
+        window.history.replaceState(null, '', `?code=${serverState.roomCode}`);
+      } catch (e) {}
+    }
+    if (serverState.phase) state.phase = serverState.phase;
+    if (typeof serverState.round === 'number') state.round = serverState.round;
+
+    if (serverState.me) {
+      state.playerId = serverState.me.id;
+      state.playerName = serverState.me.name;
+      state.role = normalizeRole(serverState.me.role) || state.role;
+      state.isModerator = !!serverState.me.isModerator;
+      state.isAlive = serverState.me.alive !== false;
+      state.isButterfly = !!serverState.me.isButterfly;
+      state.hasShield = !!serverState.me.hasShield;
+      if (serverState.me.myClue) state.myClue = serverState.me.myClue;
+      if (state.role) {
+        renderRoleDetails({ role: state.role });
+      }
+    }
+
+    if (Array.isArray(serverState.players)) {
+      state.players = mapPlayers(serverState.players);
+    }
+    if (serverState.actionLog) state.actionLedger = serverState.actionLog;
+    if (serverState.moderatorLedger) state.actionLedger = serverState.moderatorLedger;
+    if (serverState.moderatorDashboard) {
+      state.moderatorDashboard = serverState.moderatorDashboard;
+      updateModeratorDashboard(serverState.moderatorDashboard);
+    }
+    if (Array.isArray(serverState.tasks)) {
+      state.tasks = serverState.tasks;
+      renderPlayerTasks(serverState.tasks);
+    }
+    if (serverState.chats) {
+      state.chatMessages.day = serverState.chats.day || [];
+      state.chatMessages.mafia = serverState.chats.mafia || [];
+      state.chatMessages.ghost = serverState.chats.ghost || [];
+      renderChatMessages();
+    }
+
+    const chatPanel = document.getElementById('chat-panel');
+    if (chatPanel && state.roomCode) chatPanel.style.display = 'block';
+
+    updateChatTabVisibility();
+    updateLobbyUI();
+
+    if (extra.announcements && extra.announcements.length) {
+      renderDawnPhase({ message: extra.announcements.join(' ') });
+    }
+    if (extra.eliminatedPlayer || extra.announcement) {
+      renderVoteResult({
+        banished: extra.eliminatedPlayer,
+        announcement: extra.announcement,
+        tie: !extra.eliminatedPlayer
+      });
+    }
+
+    routeByPhase(serverState.phase);
+  }
+
+  function routeByPhase(phase) {
+    if (!phase) return;
+    const lower = String(phase).toLowerCase().replace(/_/g, '-');
+    if (state.isModerator && lower !== 'lobby') {
+      showScreen('screen-moderator');
+      if (state.moderatorDashboard) {
+        updateModeratorDashboard(state.moderatorDashboard);
+      }
+      return;
+    }
+    const map = {
+      lobby: 'screen-lobby',
+      'rules-display': 'screen-rules',
+      'role-reveal': 'screen-role-reveal',
+      night: 'screen-night',
+      'night-resolution': 'screen-night',
+      dawn: 'screen-dawn',
+      voting: 'screen-voting',
+      'vote-result': 'screen-vote-result',
+      'game-over': 'screen-game-over'
+    };
+    if (map[lower]) showScreen(map[lower]);
+    if (lower === 'rules-display') {
+      updateRulesCarousel();
+    }
+    if (lower === 'role-reveal') {
+      renderRoleDetails({ role: state.role });
+    }
+    if (lower === 'night' && !state.isModerator && !state.currentTrial) {
+      renderNightPanel({ round: state.round });
+    }
+    if (lower === 'voting' && !state.isModerator) {
+      const votingScreen = document.getElementById('screen-voting');
+      if (votingScreen && !votingScreen.classList.contains('active')) {
+        renderVotingScreen({ candidates: state.players });
+      }
+    }
+  }
+
+  function renderPlayerTasks(tasks) {
+    const panel = document.getElementById('task-panel');
+    const list = document.getElementById('player-task-list');
+    if (!panel || !list) return;
+    const mine = (tasks || []).filter(t =>
+      t.isPublic || (t.assigneeIds && t.assigneeIds.indexOf(state.playerId) !== -1)
+    );
+    if (!mine.length || state.isModerator) {
+      panel.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    panel.style.display = 'block';
+    list.innerHTML = mine.map(t => `
+      <div class="task-card task-${escapeHtml(t.status)}">
+        <div class="task-status">${escapeHtml(t.status)}</div>
+        <strong>${escapeHtml(t.title)}</strong>
+        <p>${escapeHtml(t.description)}</p>
+        ${t.objective ? `<p>${escapeHtml(t.objective)}</p>` : ''}
+      </div>
+    `).join('');
   }
 
   function showToast(message, duration = 3000) {
@@ -220,9 +458,24 @@
         state.playerName = name;
         state.roomCode = code;
 
-        socket.emit('join-room', {
-          roomCode: code,
-          playerName: name
+        emitAck('join-room', { roomCode: code, playerName: name }, (res) => {
+          if (!res) return;
+          if (res.sessionToken) {
+            state.sessionToken = res.sessionToken;
+            sessionStorage.setItem('dungeon-session', res.sessionToken);
+            sessionStorage.setItem('dungeon-room', code);
+            if (socket) {
+              socket.auth = { sessionToken: res.sessionToken };
+            }
+          }
+          if (res.playerId) {
+            state.playerId = res.playerId;
+          }
+          applyServerState(res.state || res);
+          try {
+            window.history.replaceState(null, '', `?code=${code}`);
+          } catch (e) {}
+          showScreen('screen-lobby');
         });
       });
     }
@@ -232,8 +485,11 @@
       const urlParams = new URLSearchParams(window.location.search);
       const codeFromUrl = urlParams.get('code');
       if (codeFromUrl && inputCode) {
-        inputCode.value = codeFromUrl.toUpperCase().slice(0, 4);
-        if (inputNameJoin) inputNameJoin.focus();
+        const cleanCode = codeFromUrl.trim().toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
+        if (cleanCode.length > 0) {
+          inputCode.value = cleanCode;
+          if (inputNameJoin) inputNameJoin.focus();
+        }
       }
     } catch (e) {}
   }
@@ -253,18 +509,45 @@
 
     if (btnConfirm) {
       btnConfirm.addEventListener('click', () => {
+        if (state.createRoomPending) return;
+
         const name = inputNameCreate ? inputNameCreate.value.trim() : '';
         if (!name) {
+          setCreateStatus(false, 'Please enter your name.');
           showToast('Please enter your name.');
           if (inputNameCreate) inputNameCreate.focus();
           return;
         }
 
+        if (!socket.connected) {
+          setCreateStatus(false, 'Not connected to the dungeon server.');
+          showToast('Not connected to the dungeon server.');
+          return;
+        }
+
         state.playerName = name;
         state.isModerator = true;
+        state.createRoomPending = true;
+        setCreateStatus(true);
 
-        socket.emit('create-room', {
-          playerName: name
+        const payload = { playerName: name };
+        const timeoutId = setTimeout(() => {
+          if (!state.createRoomPending) return;
+          state.createRoomPending = false;
+          setCreateStatus(false, 'The portal did not respond. Try again.');
+          showToast('Room creation timed out.');
+        }, 10000);
+
+        socket.emit('create-room', payload, (res) => {
+          clearTimeout(timeoutId);
+          state.createRoomPending = false;
+          if (!res || res.success === false) {
+            setCreateStatus(false, (res && (res.error || res.message)) || 'Room creation failed.');
+            showToast((res && (res.error || res.message)) || 'Room creation failed.');
+            return;
+          }
+          setCreateStatus(false);
+          applyCreatedRoom(res);
         });
       });
     }
@@ -306,21 +589,27 @@
       });
     }
 
-    const canStart = state.isModerator && state.players.length >= 5;
+    const nonModCount = state.players.filter(p => !p.isModerator).length;
+    const canStart = nonModCount >= 3;
+
+    const btnTome = document.getElementById('btn-open-tome');
     if (btnStart) {
       if (state.isModerator) {
         btnStart.style.display = 'inline-block';
-        btnStart.disabled = state.players.length < 5;
+        btnStart.disabled = !canStart;
       } else {
         btnStart.style.display = 'none';
       }
     }
+    if (btnTome) {
+      btnTome.style.display = state.isModerator ? 'inline-block' : 'none';
+    }
 
     if (statusText) {
-      if (state.players.length < 5) {
-        statusText.textContent = `Need at least 5 souls to begin the ritual (${state.players.length}/5).`;
+      if (!canStart) {
+        statusText.textContent = `Need at least 3 mortal souls to begin the ritual (${nonModCount}/3 mortals gathered).`;
       } else if (state.isModerator) {
-        statusText.textContent = 'Ritual circle is complete. You may begin the ritual!';
+        statusText.textContent = `Ritual circle is complete (${state.players.length} souls gathered). You may begin the ritual!`;
       } else {
         statusText.textContent = 'Awaiting the Moderator to begin the ritual...';
       }
@@ -334,28 +623,77 @@
     if (btnStart) {
       btnStart.addEventListener('click', () => {
         if (!state.isModerator) return;
-        if (state.players.length < 5) {
-          showToast('At least 5 players are required.');
+        const nonModCount = state.players.filter(p => !p.isModerator).length;
+        if (nonModCount < 3) {
+          showToast('At least 3 mortal souls are required.');
           return;
         }
-        socket.emit('start-game');
+        btnStart.disabled = true;
+        btnStart.textContent = 'Summoning the darkness...';
+        emitAck('start-game', {}, () => {
+          btnStart.disabled = false;
+          btnStart.textContent = 'Begin the Ritual';
+          showToast('The ritual has begun!');
+        });
+      });
+    }
+
+    const btnTome = document.getElementById('btn-open-tome');
+    if (btnTome) {
+      btnTome.addEventListener('click', () => {
+        if (!state.isModerator) return;
+        showScreen('screen-moderator');
+        emitAck('request-moderator-dashboard', {}, (res) => {
+          if (res && res.dashboard) updateModeratorDashboard(res.dashboard);
+        });
       });
     }
 
     if (inviteLink) {
       inviteLink.addEventListener('click', (e) => {
         e.preventDefault();
-        const url = `${window.location.origin}${window.location.pathname}?code=${state.roomCode || ''}`;
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(url).then(() => {
-            showToast('Invite link copied to clipboard!');
-          }).catch(() => {
-            prompt('Copy this invite link:', url);
-          });
-        } else {
-          prompt('Copy this invite link:', url);
+        const code = state.roomCode || (document.getElementById('room-code-display') ? document.getElementById('room-code-display').textContent.trim() : '');
+        if (!code || code === '----') {
+          showToast('Room code is not available yet.');
+          return;
         }
+        const url = `${window.location.origin}${window.location.pathname}?code=${encodeURIComponent(code)}`;
+        copyTextToClipboard(url, 'Invite link copied to clipboard!');
       });
+    }
+  }
+
+  function copyTextToClipboard(text, successMsg) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast(successMsg || 'Invite link copied to clipboard!');
+      }).catch(() => {
+        fallbackCopyText(text, successMsg);
+      });
+    } else {
+      fallbackCopyText(text, successMsg);
+    }
+  }
+
+  function fallbackCopyText(text, successMsg) {
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-999999px';
+      textArea.style.top = '-999999px';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const successful = document.execCommand('copy');
+      document.body.removeChild(textArea);
+      if (successful) {
+        showToast(successMsg || 'Invite link copied to clipboard!');
+      } else {
+        prompt('Copy this invite link:', text);
+      }
+    } catch (e) {
+      prompt('Copy this invite link:', text);
     }
   }
 
@@ -382,7 +720,11 @@
         }, 800);
       };
 
-      // Double-click to break the seal (as explicitly requested)
+      // Break seal on single click, double-click, tap, or enter
+      envelope.addEventListener('click', () => {
+        handleFlip();
+      });
+
       envelope.addEventListener('dblclick', (e) => {
         e.preventDefault();
         handleFlip();
@@ -419,6 +761,7 @@
   }
 
   function renderRoleDetails(roleData) {
+    roleData = roleData || {};
     const role = (roleData.role || state.role || 'CITIZEN').toUpperCase();
     state.role = role;
 
@@ -433,7 +776,9 @@
 
     if (teammatesEl) {
       if (role === 'MAFIA') {
-        const teammates = Array.isArray(roleData.teammates) ? roleData.teammates : [];
+        const teammates = (Array.isArray(roleData.teammates) && roleData.teammates.length)
+          ? roleData.teammates
+          : state.players.filter(p => p.role === 'MAFIA' && p.id !== state.playerId);
         const mateNames = teammates
           .filter(t => (t.id || t) !== (state.playerId || state.playerName))
           .map(t => typeof t === 'string' ? t : t.name);
@@ -628,9 +973,40 @@
 
       case 'DETECTIVE': {
         const otherLiving = living.filter(p => p.id !== state.playerId);
-        const clueText = promptData.clue || 'A scent of brimstone lingers near the western crypts.';
+        const clueText = promptData.clue || state.myClue;
+        if (!clueText) {
+          panel.innerHTML = `
+            <h3>Detective's Investigation</h3>
+            <p class="panel-subtitle">Conquer the rune trial to unearth a nocturnal clue.</p>
+            <button id="btn-investigate" class="btn btn-primary">Begin Investigation</button>
+          `;
+          const btnInvestigate = panel.querySelector('#btn-investigate');
+          if (btnInvestigate) {
+            btnInvestigate.addEventListener('click', () => {
+              panel.style.display = 'none';
+              emitAck('night-action', { action: 'investigate' }, (res) => {
+                const trial = res.trial;
+                if (!trial) return;
+                executeTrial(trial, (trialResult) => {
+                  emitAck('trial-result', {
+                    trialId: trial.trialId || trial.id,
+                    trialType: trial.type,
+                    success: trialResult.success,
+                    answer: trialResult.answer
+                  }, (trialRes) => {
+                    if (trialRes && trialRes.clue) {
+                      state.myClue = trialRes.clue;
+                      renderNightPanel({ round: state.round, clue: trialRes.clue });
+                    }
+                  });
+                });
+              });
+            });
+          }
+          break;
+        }
         panel.innerHTML = `
-          <h3>Detective\'s Investigation</h3>
+          <h3>Detective's Investigation</h3>
           <div class="clue-display-box">
             <strong>Revealed Clue:</strong>
             <p class="clue-text">${escapeHtml(clueText)}</p>
@@ -656,7 +1032,7 @@
           btnSkip.addEventListener('click', () => {
             panel.style.display = 'none';
             if (waitingMsg) waitingMsg.style.display = 'block';
-            socket.emit('night-action', { action: 'skip' });
+            emitAck('night-action', { action: 'skip' });
           });
         }
         break;
@@ -679,24 +1055,26 @@
         if (btnForge) {
           btnForge.addEventListener('click', () => {
             panel.style.display = 'none';
-            const defaultTrial = promptData.trial || {
-              type: 'rune-memory',
-              sequence: ['ᚠ', 'ᚢ', 'ᚦ', 'ᚨ'],
-              showTime: 3000,
-              timeLimit: 14000
-            };
-            executeTrial(defaultTrial, (trialResult) => {
-              socket.emit('trial-result', trialResult);
-              socket.emit('night-action', {
-                action: 'forge-shield',
-                success: trialResult.success
-              });
-              if (trialResult.success) {
-                state.hasShield = true;
-                showToast('Mystic shield forged successfully!');
-              } else {
-                showToast('The shield shattered during forging.');
+            emitAck('night-action', { action: 'shield' }, (res) => {
+              const trial = res.trial || promptData.trial;
+              if (!trial) {
+                showToast('No trial was issued.');
+                return;
               }
+              executeTrial(trial, (trialResult) => {
+                emitAck('trial-result', {
+                  trialId: trial.trialId || trial.id,
+                  trialType: trial.type,
+                  success: trialResult.success,
+                  answer: trialResult.answer
+                });
+                if (trialResult.success) {
+                  state.hasShield = true;
+                  showToast('Mystic shield forged successfully!');
+                } else {
+                  showToast('The shield shattered during forging.');
+                }
+              });
             });
           });
         }
@@ -705,7 +1083,7 @@
           btnRest.addEventListener('click', () => {
             panel.style.display = 'none';
             if (waitingMsg) waitingMsg.style.display = 'block';
-            socket.emit('night-action', { action: 'rest' });
+            emitAck('night-action', { action: 'rest' });
           });
         }
         break;
@@ -733,31 +1111,32 @@
 
         panel.style.display = 'none';
 
-        // If trial required (Mafia kill or Doctor save)
-        if (actionType === 'kill' || actionType === 'save') {
-          const trial = trialConfig || {
-            type: actionType === 'kill' ? 'lockpick-rhythm' : 'rune-memory',
-            pattern: [500, 350, 650, 400],
-            sequence: ['ᚠ', 'ᚢ', 'ᛃ', 'ᚱ'],
-            tolerance: 180,
-            showTime: 3000,
-            timeLimit: 15000
-          };
-
-          executeTrial(trial, (trialResult) => {
-            socket.emit('trial-result', trialResult);
-            socket.emit('night-action', {
-              action: actionType,
-              targetId: selectedId,
-              success: trialResult.success
+        if (actionType === 'kill' || actionType === 'save' || actionType === 'investigate') {
+          emitAck('night-action', { action: actionType, targetId: selectedId }, (res) => {
+            const trial = res.trial || trialConfig;
+            if (!trial) {
+              showToast('No trial was issued by the dungeon.');
+              return;
+            }
+            executeTrial(trial, (trialResult) => {
+              emitAck('trial-result', {
+                trialId: trial.trialId || trial.id,
+                trialType: trial.type,
+                success: trialResult.success,
+                answer: trialResult.answer
+              }, (trialRes) => {
+                if (trialRes && trialRes.clue) {
+                  showToast(`Clue unsealed: ${trialRes.clue}`, 5000);
+                }
+              });
             });
           });
+        } else if (actionType === 'share-clue') {
+          emitAck('share-clue', { targetPlayerId: selectedId });
+          const waitingMsg = document.getElementById('night-waiting');
+          if (waitingMsg) waitingMsg.style.display = 'block';
         } else {
-          // Detective share clue
-          socket.emit('night-action', {
-            action: actionType,
-            targetId: selectedId
-          });
+          emitAck('night-action', { action: actionType, targetId: selectedId });
           const waitingMsg = document.getElementById('night-waiting');
           if (waitingMsg) waitingMsg.style.display = 'block';
         }
@@ -1047,6 +1426,7 @@
     const btnPause = document.getElementById('btn-mod-pause');
     const btnKick = document.getElementById('btn-mod-kick');
     const kickSelect = document.getElementById('mod-kick-select');
+    const btnBackLobby = document.getElementById('btn-mod-back-lobby');
 
     if (btnAdvance) {
       btnAdvance.addEventListener('click', () => {
@@ -1066,6 +1446,12 @@
       });
     }
 
+    if (btnBackLobby) {
+      btnBackLobby.addEventListener('click', () => {
+        showScreen('screen-lobby');
+      });
+    }
+
     if (btnKick) {
       btnKick.addEventListener('click', () => {
         if (!kickSelect) return;
@@ -1079,19 +1465,133 @@
         }
       });
     }
+
+    // Task Assignment Form and Controls
+    const taskForm = document.getElementById('mod-task-form');
+    const playerSelect = document.getElementById('mod-task-player');
+    const roleSelect = document.getElementById('mod-task-role');
+
+    if (playerSelect && roleSelect) {
+      playerSelect.addEventListener('change', () => {
+        if (playerSelect.value) roleSelect.value = '';
+      });
+      roleSelect.addEventListener('change', () => {
+        if (roleSelect.value) playerSelect.value = '';
+      });
+    }
+
+    if (taskForm) {
+      taskForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const targetId = playerSelect ? playerSelect.value : '';
+        const role = roleSelect ? roleSelect.value : '';
+        const titleInput = document.getElementById('mod-task-title');
+        const descInput = document.getElementById('mod-task-description');
+        const condSelect = document.getElementById('mod-task-condition');
+        const limitInput = document.getElementById('mod-task-limit');
+        const publicCheck = document.getElementById('mod-task-public');
+
+        const title = titleInput ? titleInput.value.trim() : '';
+        const description = descInput ? descInput.value.trim() : '';
+
+        if (!targetId && !role) {
+          showToast('Please select a specific player or an eligible role.');
+          return;
+        }
+        if (!title) {
+          showToast('Please enter a task title.');
+          if (titleInput) titleInput.focus();
+          return;
+        }
+        if (!description) {
+          showToast('Please enter a task description.');
+          if (descInput) descInput.focus();
+          return;
+        }
+
+        const payload = {
+          title,
+          description,
+          objective: description,
+          completionCondition: condSelect ? condSelect.value : 'moderator_verify',
+          isPublic: publicCheck ? publicCheck.checked : false
+        };
+
+        if (targetId) payload.targetId = targetId;
+        if (role) payload.role = role;
+
+        if (limitInput && limitInput.value) {
+          const sec = parseInt(limitInput.value, 10);
+          if (Number.isFinite(sec) && sec > 0) {
+            payload.timeLimitSeconds = sec;
+          }
+        }
+
+        emitAck('assign-task', payload, () => {
+          showToast(`Charge inscribed: "${title}"`);
+          if (titleInput) titleInput.value = '';
+          if (descInput) descInput.value = '';
+          if (playerSelect) playerSelect.value = '';
+          if (roleSelect) roleSelect.value = '';
+          if (limitInput) limitInput.value = '';
+          if (publicCheck) publicCheck.checked = false;
+        });
+      });
+    }
+
+    // Task List Action Delegation (Verify, Mark Failed, Cancel)
+    const modTaskList = document.getElementById('mod-task-list');
+    if (modTaskList) {
+      modTaskList.addEventListener('click', (e) => {
+        const completeBtn = e.target.closest('.btn-task-verify-complete');
+        const failBtn = e.target.closest('.btn-task-verify-fail');
+        const cancelBtn = e.target.closest('.btn-task-cancel');
+
+        if (completeBtn) {
+          const taskId = completeBtn.dataset.taskId;
+          emitAck('verify-task', { taskId, outcome: 'completed' }, () => {
+            showToast('Charge verified as completed.');
+          });
+        } else if (failBtn) {
+          const taskId = failBtn.dataset.taskId;
+          emitAck('verify-task', { taskId, outcome: 'failed' }, () => {
+            showToast('Charge marked as failed.');
+          });
+        } else if (cancelBtn) {
+          const taskId = cancelBtn.dataset.taskId;
+          emitAck('cancel-task', { taskId }, () => {
+            showToast('Charge cancelled.');
+          });
+        }
+      });
+    }
   }
 
   function updateModeratorDashboard(data) {
-    if (!state.isModerator) return;
+    if (!state.isModerator || !data) return;
 
+    const modRoomCode = document.getElementById('mod-room-code');
+    const modPhaseBadge = document.getElementById('mod-phase-badge');
     const playersContainer = document.getElementById('mod-players');
     const actionLogContainer = document.getElementById('mod-action-log');
     const kickSelect = document.getElementById('mod-kick-select');
+    const taskPlayerSelect = document.getElementById('mod-task-player');
+    const modTaskList = document.getElementById('mod-task-list');
     const btnCloseVotes = document.getElementById('btn-mod-close-votes');
+
+    // Update Room Code & Phase Badge in Tome Header
+    if (modRoomCode) {
+      modRoomCode.textContent = data.roomCode || state.roomCode || '';
+    }
+    if (modPhaseBadge) {
+      const curPhase = data.phase || state.phase || 'LOBBY';
+      const curRound = data.round || state.round || 1;
+      modPhaseBadge.textContent = `${curPhase.replace(/_/g, ' ')} — Round ${curRound}`;
+    }
 
     // Show/hide close votes button based on phase
     if (btnCloseVotes) {
-      btnCloseVotes.style.display = state.phase === 'voting' ? 'inline-block' : 'none';
+      btnCloseVotes.style.display = (data.phase || state.phase) === 'VOTING' ? 'inline-block' : 'none';
     }
 
     // Update players list / table
@@ -1112,7 +1612,7 @@
               <tr>
                 <td>${escapeHtml(p.name)}</td>
                 <td><span class="role-badge role-${(p.role || '').toLowerCase()}">${escapeHtml(p.role || 'None')}</span></td>
-                <td>${p.isAlive !== false ? '🟢 Alive' : '💀 Dead'}</td>
+                <td>${p.isAlive !== false && p.alive !== false ? '🟢 Alive' : '💀 Dead'}</td>
                 <td>${p.isButterfly ? '🦋 Silenced' : '—'}</td>
                 <td>${p.hasShield ? '🛡️ Shielded' : '—'}</td>
               </tr>
@@ -1127,12 +1627,28 @@
       const currentSelected = kickSelect.value;
       kickSelect.innerHTML = '<option value="">-- Select Soul to Kick --</option>';
       data.players.forEach(p => {
-        if (p.id !== state.playerId) {
+        if (!p.isModerator && p.id !== state.playerId) {
           const opt = document.createElement('option');
           opt.value = p.id;
           opt.textContent = `${p.name} (${p.role || 'Unknown'})`;
           if (p.id === currentSelected) opt.selected = true;
           kickSelect.appendChild(opt);
+        }
+      });
+    }
+
+    // Update task assignment Soul dropdown
+    if (taskPlayerSelect && data.players) {
+      const currentSelected = taskPlayerSelect.value;
+      taskPlayerSelect.innerHTML = '<option value="">— Specific player —</option>';
+      data.players.forEach(p => {
+        if (!p.isModerator) {
+          const opt = document.createElement('option');
+          opt.value = p.id;
+          const roleText = p.role ? ` (${p.role})` : '';
+          opt.textContent = `${p.name}${roleText}`;
+          if (p.id === currentSelected) opt.selected = true;
+          taskPlayerSelect.appendChild(opt);
         }
       });
     }
@@ -1143,10 +1659,62 @@
       data.actionLog.forEach(logItem => {
         const item = document.createElement('div');
         item.className = 'action-log-item';
-        item.textContent = typeof logItem === 'string' ? logItem : `[${logItem.time || ''}] ${logItem.text}`;
+        item.textContent = typeof logItem === 'string' ? logItem : `[${logItem.time || (logItem.timestamp ? new Date(logItem.timestamp).toLocaleTimeString() : '')}] ${logItem.text}`;
         actionLogContainer.appendChild(item);
       });
       actionLogContainer.scrollTop = actionLogContainer.scrollHeight;
+    }
+
+    // Update Assigned Charges List
+    if (modTaskList) {
+      const tasks = data.tasks || state.tasks || [];
+      if (!tasks.length) {
+        modTaskList.innerHTML = '<p class="status-hint" style="color:var(--parchment-dim); font-style:italic; padding:0.5rem 0;">No charges inscribed yet.</p>';
+      } else {
+        modTaskList.innerHTML = tasks.map(t => {
+          const assigneesText = (t.assignees && t.assignees.length)
+            ? t.assignees.map(a => `${escapeHtml(a.name)}${a.role ? ` (${escapeHtml(a.role)})` : ''}`).join(', ')
+            : (t.assigneeRole ? `Role: ${escapeHtml(t.assigneeRole)}` : 'All Souls');
+          const isOpen = t.status === 'pending' || t.status === 'in_progress';
+          const conditionLabel = {
+            moderator_verify: 'Moderator verifies',
+            night_action: 'Complete night action',
+            trial_success: 'Succeed at trial',
+            survive_night: 'Survive the night',
+            cast_vote: 'Cast tribunal vote'
+          }[t.completionCondition] || t.completionCondition;
+
+          let actionsHtml = '';
+          if (isOpen) {
+            actionsHtml = `
+              <div class="task-actions">
+                ${t.completionCondition === 'moderator_verify' ? `
+                  <button type="button" class="btn btn-sm btn-primary btn-task-verify-complete" data-task-id="${escapeHtml(t.id)}">Verify Complete</button>
+                  <button type="button" class="btn btn-sm btn-danger btn-task-verify-fail" data-task-id="${escapeHtml(t.id)}">Mark Failed</button>
+                ` : ''}
+                <button type="button" class="btn btn-sm btn-secondary btn-task-cancel" data-task-id="${escapeHtml(t.id)}">Cancel</button>
+              </div>
+            `;
+          }
+
+          return `
+            <div class="task-card task-${escapeHtml(t.status)}">
+              <div class="task-card-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
+                <span class="task-status">${escapeHtml(t.status)}</span>
+                ${t.isPublic ? '<span class="badge" style="font-size:0.7rem; background:rgba(212,175,55,0.2); color:var(--gold);">Public</span>' : ''}
+              </div>
+              <strong>${escapeHtml(t.title)}</strong>
+              <p style="margin:0.25rem 0;">${escapeHtml(t.description)}</p>
+              <div style="font-size:0.8rem; color:var(--parchment-dim); margin-top:0.35rem; line-height:1.4;">
+                <div><strong>Assigned:</strong> ${assigneesText}</div>
+                <div><strong>Condition:</strong> ${escapeHtml(conditionLabel)}</div>
+                ${t.resultNote ? `<div><strong>Result:</strong> ${escapeHtml(t.resultNote)}</div>` : ''}
+              </div>
+              ${actionsHtml}
+            </div>
+          `;
+        }).join('');
+      }
     }
   }
 
@@ -1318,12 +1886,38 @@
       state.isModerator = true;
       state.playerId = data.playerId;
       if (data.sessionToken) {
-        localStorage.setItem('dungeon-session', data.sessionToken);
+        sessionStorage.setItem('dungeon-session', data.sessionToken);
+        if (data.roomCode) sessionStorage.setItem('dungeon-room', data.roomCode);
+        if (socket) socket.auth = { sessionToken: data.sessionToken };
       }
       state.players = data.players || [{ name: state.playerName, id: data.playerId, isModerator: true }];
       updateLobbyUI();
       showScreen('screen-lobby');
       showToast(`Dungeon room created: ${data.roomCode}`);
+    });
+
+    // Room joined by current player
+    socket.on('room-joined', (data) => {
+      if (!data) return;
+      if (data.roomCode) {
+        state.roomCode = data.roomCode;
+        sessionStorage.setItem('dungeon-room', data.roomCode);
+        try {
+          window.history.replaceState(null, '', `?code=${data.roomCode}`);
+        } catch (e) {}
+      }
+      if (data.sessionToken) {
+        state.sessionToken = data.sessionToken;
+        sessionStorage.setItem('dungeon-session', data.sessionToken);
+        if (socket) socket.auth = { sessionToken: data.sessionToken };
+      }
+      if (data.playerId && !state.playerId) {
+        state.playerId = data.playerId;
+      }
+      if (data.state) {
+        applyServerState(data.state);
+      }
+      showScreen('screen-lobby');
     });
 
     // Room joined
@@ -1334,11 +1928,18 @@
         const existing = state.players.find(p => p.id === data.player.id);
         if (!existing) state.players.push(data.player);
       }
-      if (data.roomCode) state.roomCode = data.roomCode;
+      if (data.roomCode) {
+        state.roomCode = data.roomCode;
+        sessionStorage.setItem('dungeon-room', data.roomCode);
+        try {
+          window.history.replaceState(null, '', `?code=${data.roomCode}`);
+        } catch (e) {}
+      }
       if (data.playerId && !state.playerId) state.playerId = data.playerId;
       if (data.sessionToken) {
         state.sessionToken = data.sessionToken;
-        localStorage.setItem('dungeon-session', data.sessionToken);
+        sessionStorage.setItem('dungeon-session', data.sessionToken);
+        if (socket) socket.auth = { sessionToken: data.sessionToken };
       }
 
       updateLobbyUI();
@@ -1348,11 +1949,54 @@
       }
     });
 
+    // Authoritative game state broadcast
+    socket.on('game-state', (data) => {
+      if (data) {
+        applyServerState(data, data);
+      }
+    });
+
+    // Reconnection response
+    socket.on('reconnected', (data) => {
+      if (data) {
+        if (data.roomCode) {
+          state.roomCode = data.roomCode;
+          sessionStorage.setItem('dungeon-room', data.roomCode);
+          try {
+            window.history.replaceState(null, '', `?code=${data.roomCode}`);
+          } catch (e) {}
+        }
+        if (data.sessionToken) {
+          state.sessionToken = data.sessionToken;
+          sessionStorage.setItem('dungeon-session', data.sessionToken);
+          if (socket) socket.auth = { sessionToken: data.sessionToken };
+        }
+        if (data.state) {
+          applyServerState(data.state);
+        }
+      }
+    });
+
+    // Real-time task assigned to this player
+    socket.on('task-assigned', (task) => {
+      if (!task) return;
+      showToast(`A new charge has been inscribed: "${task.title}"`, 4000);
+      if (!state.tasks) state.tasks = [];
+      const existingIdx = state.tasks.findIndex(t => t.id === task.id);
+      if (existingIdx !== -1) {
+        state.tasks[existingIdx] = task;
+      } else {
+        state.tasks.push(task);
+      }
+      renderPlayerTasks(state.tasks);
+    });
+
     // Game ritual started
     socket.on('game-started', () => {
-      state.phase = 'role-reveal';
-      showScreen('screen-role-reveal');
-      showToast('The ritual begins. Sealed envelopes are distributed!');
+      state.phase = 'rules-display';
+      showScreen('screen-rules');
+      updateRulesCarousel();
+      showToast('The ritual begins. Sacred laws are displayed!');
     });
 
     // Role reveal payload
