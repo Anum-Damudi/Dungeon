@@ -1663,8 +1663,9 @@ class GameManager {
     const assigneeIds = new Set();
     let assigneeRole = null;
 
-    if (payload.targetId) {
-      const target = room.players.get(payload.targetId);
+    const targetId = payload.targetId || payload.playerId;
+    if (targetId) {
+      const target = room.players.get(targetId);
       if (!target || target.isModerator) {
         throw new Error('Target player is not eligible for a task.');
       }
@@ -1799,7 +1800,7 @@ class GameManager {
   }
 
   handleCancelTask(sessionToken, payload = {}) {
-    const { room } = this.requireModerator(sessionToken);
+    const { room, player } = this.requireModerator(sessionToken);
     const task = room.tasks.get(payload.taskId);
     if (!task) throw new Error('Task not found.');
     if (!OPEN_TASK_STATUSES.includes(task.status)) {
@@ -1807,11 +1808,14 @@ class GameManager {
     }
     this.setTaskStatus(room, task, TASK_STATUSES.CANCELLED, payload.note || 'Cancelled by moderator.');
     this.broadcastRoomState(room);
+    if (this.io && player.socketId) {
+      this.io.to(player.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
+    }
     return { success: true, task: this.serializeTask(task, room) };
   }
 
   handleVerifyTask(sessionToken, payload = {}) {
-    const { room } = this.requireModerator(sessionToken);
+    const { room, player } = this.requireModerator(sessionToken);
     const task = room.tasks.get(payload.taskId);
     if (!task) throw new Error('Task not found.');
     if (!OPEN_TASK_STATUSES.includes(task.status)) {
@@ -1820,6 +1824,9 @@ class GameManager {
     const outcome = payload.outcome === TASK_STATUSES.FAILED ? TASK_STATUSES.FAILED : TASK_STATUSES.COMPLETED;
     this.setTaskStatus(room, task, outcome, payload.note || 'Verified by moderator.');
     this.broadcastRoomState(room);
+    if (this.io && player.socketId) {
+      this.io.to(player.socketId).emit('moderator-update', this.buildModeratorDashboard(room));
+    }
     return { success: true, task: this.serializeTask(task, room) };
   }
 

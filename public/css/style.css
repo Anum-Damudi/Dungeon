@@ -447,6 +447,13 @@ a:hover {
   box-shadow: 0 0 12px var(--gold-glow);
 }
 
+/* Small Button for Cards and Tables */
+.btn-sm {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+}
+
 /* --------------------------------------------------------------------------
    7. Form Inputs & Elements
    -------------------------------------------------------------------------- */
