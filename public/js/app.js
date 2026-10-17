@@ -37,7 +37,20 @@
       ghost: [],
       mafia: []
     },
-    actionLedger: []
+    actionLedger: [],
+    tasks: [],
+    moderatorDashboard: null,
+    createRoomPending: false
+  };
+
+  const CHANNEL_TO_SERVER = { day: 'dayChat', mafia: 'mafiaChat', ghost: 'ghostChat' };
+  const CHANNEL_FROM_SERVER = {
+    dayChat: 'day',
+    mafiaChat: 'mafia',
+    ghostChat: 'ghost',
+    day: 'day',
+    mafia: 'mafia',
+    ghost: 'ghost'
   };
 
   // 12 sacred rules of DUNGEON (Exact laws)
@@ -104,6 +117,182 @@
         window.destroyPortal();
       }
     }
+  }
+
+  function emitAck(event, payload, onSuccess) {
+    const body = Object.assign({ sessionToken: state.sessionToken }, payload || {});
+    socket.emit(event, body, (res) => {
+      if (!res || res.success === false) {
+        const msg = (res && (res.error || res.message)) || 'The dungeon rejected that request.';
+        showToast(msg, 3500);
+        return;
+      }
+      if (typeof onSuccess === 'function') onSuccess(res);
+    });
+  }
+
+  function normalizeRole(role) {
+    return role ? String(role).toUpperCase() : null;
+  }
+
+  function mapPlayers(list) {
+    return (list || []).map(p => ({
+      ...p,
+      role: p.role ? String(p.role).toUpperCase() : p.role,
+      isAlive: p.isAlive !== undefined ? p.isAlive : p.alive !== false
+    }));
+  }
+
+  function applyCreatedRoom(data) {
+    const code = data.roomCode || data.code || (data.state && data.state.roomCode);
+    if (!code) {
+      setCreateStatus(false, 'The portal opened, but no room code was returned.');
+      showToast('Room creation failed: missing room code.');
+      return false;
+    }
+    state.roomCode = code;
+    state.sessionToken = data.sessionToken || state.sessionToken;
+    state.isModerator = true;
+    state.playerId = data.playerId || (data.state && data.state.me && data.state.me.id) || state.sessionToken;
+    if (state.sessionToken) {
+      localStorage.setItem('dungeon-session', state.sessionToken);
+    }
+    if (data.state) {
+      applyServerState(data.state);
+    } else {
+      state.players = mapPlayers(data.players) || [{ name: state.playerName, id: state.playerId, isModerator: true, isAlive: true }];
+      updateLobbyUI();
+    }
+    const chatPanel = document.getElementById('chat-panel');
+    if (chatPanel) chatPanel.style.display = 'block';
+    showScreen('screen-lobby');
+    showToast(`Dungeon room created: ${code}`);
+    return true;
+  }
+
+  function setCreateStatus(isLoading, errorMsg) {
+    const btn = document.getElementById('btn-create-confirm');
+    const status = document.getElementById('create-status');
+    if (btn) {
+      btn.disabled = !!isLoading;
+      btn.textContent = isLoading ? 'Opening the portal...' : 'Summon the Portal';
+    }
+    if (status) {
+      status.textContent = errorMsg || (isLoading ? 'Inscribing a unique room sigil...' : '');
+      status.classList.toggle('error', !!errorMsg);
+    }
+  }
+
+  function applyServerState(serverState, extra) {
+    extra = extra || {};
+    if (!serverState) return;
+
+    if (serverState.roomCode) state.roomCode = serverState.roomCode;
+    if (serverState.phase) state.phase = serverState.phase;
+    if (typeof serverState.round === 'number') state.round = serverState.round;
+
+        if (serverState.me) {
+      state.playerId = serverState.me.id;
+      state.playerName = serverState.me.name;
+      state.role = normalizeRole(serverState.me.role) || state.role;
+      state.isModerator = !!serverState.me.isModerator;
+      state.isAlive = serverState.me.alive !== false;
+      state.isButterfly = !!serverState.me.isButterfly;
+      state.hasShield = !!serverState.me.hasShield;
+      if (serverState.me.myClue) state.myClue = serverState.me.myClue;
+    }
+
+    if (Array.isArray(serverState.players)) {
+      state.players = mapPlayers(serverState.players);
+    }
+    if (serverState.actionLog) state.actionLedger = serverState.actionLog;
+    if (serverState.moderatorLedger) state.actionLedger = serverState.moderatorLedger;
+    if (serverState.moderatorDashboard) {
+      state.moderatorDashboard = serverState.moderatorDashboard;
+      updateModeratorDashboard(serverState.moderatorDashboard);
+    }
+    if (Array.isArray(serverState.tasks)) {
+      state.tasks = serverState.tasks;
+      renderPlayerTasks(serverState.tasks);
+    }
+    if (serverState.chats) {
+      state.chatMessages.day = serverState.chats.day || [];
+      state.chatMessages.mafia = serverState.chats.mafia || [];
+      state.chatMessages.ghost = serverState.chats.ghost || [];
+      renderChatMessages();
+    }
+
+    const chatPanel = document.getElementById('chat-panel');
+    if (chatPanel && state.roomCode) chatPanel.style.display = 'block';
+
+    updateChatTabVisibility();
+    updateLobbyUI();
+
+    if (extra.announcements && extra.announcements.length) {
+      renderDawnPhase({ message: extra.announcements.join(' ') });
+    }
+    if (extra.eliminatedPlayer || extra.announcement) {
+      renderVoteResult({
+        banished: extra.eliminatedPlayer,
+        announcement: extra.announcement,
+        tie: !extra.eliminatedPlayer
+      });
+    }
+
+    routeByPhase(serverState.phase);
+  }
+
+  function routeByPhase(phase) {
+    if (!phase) return;
+    const lower = String(phase).toLowerCase().replace(/_/g, '-');
+    if (state.isModerator && lower !== 'lobby') {
+      showScreen('screen-moderator');
+      return;
+    }
+    const map = {
+      lobby: 'screen-lobby',
+      'rules-display': 'screen-rules',
+      'role-reveal': 'screen-role-reveal',
+      night: 'screen-night',
+      'night-resolution': 'screen-night',
+      dawn: 'screen-dawn',
+      voting: 'screen-voting',
+      'vote-result': 'screen-vote-result',
+      'game-over': 'screen-game-over'
+    };
+    if (map[lower]) showScreen(map[lower]);
+    if (lower === 'night' && !state.isModerator && !state.currentTrial) {
+      renderNightPanel({ round: state.round });
+    }
+    if (lower === 'voting' && !state.isModerator) {
+      const votingScreen = document.getElementById('screen-voting');
+      if (votingScreen && !votingScreen.classList.contains('active')) {
+        renderVotingScreen({ candidates: state.players });
+      }
+    }
+  }
+
+  function renderPlayerTasks(tasks) {
+    const panel = document.getElementById('task-panel');
+    const list = document.getElementById('player-task-list');
+    if (!panel || !list) return;
+    const mine = (tasks || []).filter(t =>
+      t.isPublic || (t.assigneeIds && t.assigneeIds.indexOf(state.playerId) !== -1)
+    );
+    if (!mine.length || state.isModerator) {
+      panel.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    panel.style.display = 'block';
+    list.innerHTML = mine.map(t => `
+      <div class="task-card task-${escapeHtml(t.status)}">
+        <div class="task-status">${escapeHtml(t.status)}</div>
+        <strong>${escapeHtml(t.title)}</strong>
+        <p>${escapeHtml(t.description)}</p>
+        ${t.objective ? `<p>${escapeHtml(t.objective)}</p>` : ''}
+      </div>
+    `).join('');
   }
 
   function showToast(message, duration = 3000) {
@@ -220,9 +409,9 @@
         state.playerName = name;
         state.roomCode = code;
 
-        socket.emit('join-room', {
-          roomCode: code,
-          playerName: name
+        emitAck('join-room', { roomCode: code, playerName: name }, (res) => {
+          applyServerState(res.state || res);
+          showScreen('screen-lobby');
         });
       });
     }
@@ -253,18 +442,45 @@
 
     if (btnConfirm) {
       btnConfirm.addEventListener('click', () => {
+        if (state.createRoomPending) return;
+
         const name = inputNameCreate ? inputNameCreate.value.trim() : '';
         if (!name) {
+          setCreateStatus(false, 'Please enter your name.');
           showToast('Please enter your name.');
           if (inputNameCreate) inputNameCreate.focus();
           return;
         }
 
+        if (!socket.connected) {
+          setCreateStatus(false, 'Not connected to the dungeon server.');
+          showToast('Not connected to the dungeon server.');
+          return;
+        }
+
         state.playerName = name;
         state.isModerator = true;
+        state.createRoomPending = true;
+        setCreateStatus(true);
 
-        socket.emit('create-room', {
-          playerName: name
+        const payload = { playerName: name };
+        const timeoutId = setTimeout(() => {
+          if (!state.createRoomPending) return;
+          state.createRoomPending = false;
+          setCreateStatus(false, 'The portal did not respond. Try again.');
+          showToast('Room creation timed out.');
+        }, 10000);
+
+        socket.emit('create-room', payload, (res) => {
+          clearTimeout(timeoutId);
+          state.createRoomPending = false;
+          if (!res || res.success === false) {
+            setCreateStatus(false, (res && (res.error || res.message)) || 'Room creation failed.');
+            showToast((res && (res.error || res.message)) || 'Room creation failed.');
+            return;
+          }
+          setCreateStatus(false);
+          applyCreatedRoom(res);
         });
       });
     }
@@ -306,7 +522,7 @@
       });
     }
 
-    const canStart = state.isModerator && state.players.length >= 5;
+    const btnTome = document.getElementById('btn-open-tome');
     if (btnStart) {
       if (state.isModerator) {
         btnStart.style.display = 'inline-block';
@@ -314,6 +530,9 @@
       } else {
         btnStart.style.display = 'none';
       }
+    }
+    if (btnTome) {
+      btnTome.style.display = state.isModerator ? 'inline-block' : 'none';
     }
 
     if (statusText) {
@@ -338,7 +557,18 @@
           showToast('At least 5 players are required.');
           return;
         }
-        socket.emit('start-game');
+        emitAck('start-game', {});
+      });
+    }
+
+    const btnTome = document.getElementById('btn-open-tome');
+    if (btnTome) {
+      btnTome.addEventListener('click', () => {
+        if (!state.isModerator) return;
+        showScreen('screen-moderator');
+        emitAck('request-moderator-dashboard', {}, (res) => {
+          if (res.dashboard) updateModeratorDashboard(res.dashboard);
+        });
       });
     }
 
@@ -628,9 +858,40 @@
 
       case 'DETECTIVE': {
         const otherLiving = living.filter(p => p.id !== state.playerId);
-        const clueText = promptData.clue || 'A scent of brimstone lingers near the western crypts.';
+        const clueText = promptData.clue || state.myClue;
+        if (!clueText) {
+          panel.innerHTML = `
+            <h3>Detective's Investigation</h3>
+            <p class="panel-subtitle">Conquer the rune trial to unearth a nocturnal clue.</p>
+            <button id="btn-investigate" class="btn btn-primary">Begin Investigation</button>
+          `;
+          const btnInvestigate = panel.querySelector('#btn-investigate');
+          if (btnInvestigate) {
+            btnInvestigate.addEventListener('click', () => {
+              panel.style.display = 'none';
+              emitAck('night-action', { action: 'investigate' }, (res) => {
+                const trial = res.trial;
+                if (!trial) return;
+                executeTrial(trial, (trialResult) => {
+                  emitAck('trial-result', {
+                    trialId: trial.trialId || trial.id,
+                    trialType: trial.type,
+                    success: trialResult.success,
+                    answer: trialResult.answer
+                  }, (trialRes) => {
+                    if (trialRes && trialRes.clue) {
+                      state.myClue = trialRes.clue;
+                      renderNightPanel({ round: state.round, clue: trialRes.clue });
+                    }
+                  });
+                });
+              });
+            });
+          }
+          break;
+        }
         panel.innerHTML = `
-          <h3>Detective\'s Investigation</h3>
+          <h3>Detective's Investigation</h3>
           <div class="clue-display-box">
             <strong>Revealed Clue:</strong>
             <p class="clue-text">${escapeHtml(clueText)}</p>
@@ -656,7 +917,7 @@
           btnSkip.addEventListener('click', () => {
             panel.style.display = 'none';
             if (waitingMsg) waitingMsg.style.display = 'block';
-            socket.emit('night-action', { action: 'skip' });
+            emitAck('night-action', { action: 'skip' });
           });
         }
         break;
@@ -679,24 +940,26 @@
         if (btnForge) {
           btnForge.addEventListener('click', () => {
             panel.style.display = 'none';
-            const defaultTrial = promptData.trial || {
-              type: 'rune-memory',
-              sequence: ['ᚠ', 'ᚢ', 'ᚦ', 'ᚨ'],
-              showTime: 3000,
-              timeLimit: 14000
-            };
-            executeTrial(defaultTrial, (trialResult) => {
-              socket.emit('trial-result', trialResult);
-              socket.emit('night-action', {
-                action: 'forge-shield',
-                success: trialResult.success
-              });
-              if (trialResult.success) {
-                state.hasShield = true;
-                showToast('Mystic shield forged successfully!');
-              } else {
-                showToast('The shield shattered during forging.');
+            emitAck('night-action', { action: 'shield' }, (res) => {
+              const trial = res.trial || promptData.trial;
+              if (!trial) {
+                showToast('No trial was issued.');
+                return;
               }
+              executeTrial(trial, (trialResult) => {
+                emitAck('trial-result', {
+                  trialId: trial.trialId || trial.id,
+                  trialType: trial.type,
+                  success: trialResult.success,
+                  answer: trialResult.answer
+                });
+                if (trialResult.success) {
+                  state.hasShield = true;
+                  showToast('Mystic shield forged successfully!');
+                } else {
+                  showToast('The shield shattered during forging.');
+                }
+              });
             });
           });
         }
@@ -705,7 +968,7 @@
           btnRest.addEventListener('click', () => {
             panel.style.display = 'none';
             if (waitingMsg) waitingMsg.style.display = 'block';
-            socket.emit('night-action', { action: 'rest' });
+            emitAck('night-action', { action: 'rest' });
           });
         }
         break;
@@ -733,31 +996,32 @@
 
         panel.style.display = 'none';
 
-        // If trial required (Mafia kill or Doctor save)
-        if (actionType === 'kill' || actionType === 'save') {
-          const trial = trialConfig || {
-            type: actionType === 'kill' ? 'lockpick-rhythm' : 'rune-memory',
-            pattern: [500, 350, 650, 400],
-            sequence: ['ᚠ', 'ᚢ', 'ᛃ', 'ᚱ'],
-            tolerance: 180,
-            showTime: 3000,
-            timeLimit: 15000
-          };
-
-          executeTrial(trial, (trialResult) => {
-            socket.emit('trial-result', trialResult);
-            socket.emit('night-action', {
-              action: actionType,
-              targetId: selectedId,
-              success: trialResult.success
+        if (actionType === 'kill' || actionType === 'save' || actionType === 'investigate') {
+          emitAck('night-action', { action: actionType, targetId: selectedId }, (res) => {
+            const trial = res.trial || trialConfig;
+            if (!trial) {
+              showToast('No trial was issued by the dungeon.');
+              return;
+            }
+            executeTrial(trial, (trialResult) => {
+              emitAck('trial-result', {
+                trialId: trial.trialId || trial.id,
+                trialType: trial.type,
+                success: trialResult.success,
+                answer: trialResult.answer
+              }, (trialRes) => {
+                if (trialRes && trialRes.clue) {
+                  showToast(`Clue unsealed: ${trialRes.clue}`, 5000);
+                }
+              });
             });
           });
+        } else if (actionType === 'share-clue') {
+          emitAck('share-clue', { targetPlayerId: selectedId });
+          const waitingMsg = document.getElementById('night-waiting');
+          if (waitingMsg) waitingMsg.style.display = 'block';
         } else {
-          // Detective share clue
-          socket.emit('night-action', {
-            action: actionType,
-            targetId: selectedId
-          });
+          emitAck('night-action', { action: actionType, targetId: selectedId });
           const waitingMsg = document.getElementById('night-waiting');
           if (waitingMsg) waitingMsg.style.display = 'block';
         }

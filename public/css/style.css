@@ -1473,6 +1473,134 @@ select option {
   max-width: 450px;
 }
 
+.room-code-inline {
+  font-size: 1.15rem;
+  letter-spacing: 0.35em;
+  margin: 0 0.75rem;
+}
+
+.status-text.error {
+  color: var(--gold-light);
+  border-color: var(--blood);
+}
+
+.mod-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  color: var(--parchment);
+}
+
+.mod-table th,
+.mod-table td {
+  border-bottom: 1px solid rgba(200, 164, 86, 0.2);
+  padding: 0.45rem 0.4rem;
+  text-align: left;
+}
+
+.mod-table th {
+  font-family: var(--font-heading);
+  color: var(--gold);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.mod-tasks-section,
+.mod-players-section,
+.mod-ledger-section {
+  width: 100%;
+  text-align: left;
+}
+
+.mod-task-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.mod-task-form input,
+.mod-task-form select,
+.mod-task-form textarea {
+  background: rgba(13, 2, 8, 0.85);
+  border: 1px solid var(--gold-dark);
+  color: var(--parchment);
+  font-family: var(--font-body);
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius-sm);
+}
+
+.mod-task-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.mod-task-row label {
+  font-size: 0.85rem;
+  color: var(--gold);
+}
+
+.mod-task-list,
+.player-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.task-card {
+  background: rgba(42, 10, 18, 0.8);
+  border: 1px solid var(--gold-dark);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+
+.task-card .task-status {
+  font-family: var(--font-heading);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--gold-light);
+}
+
+.task-card.task-failed .task-status,
+.task-card.task-expired .task-status {
+  color: var(--blood-bright);
+}
+
+.task-card.task-completed .task-status {
+  color: var(--emerald-light);
+}
+
+.task-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.task-panel {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 1.5rem;
+  z-index: var(--z-floating);
+  width: 280px;
+  max-width: calc(100vw - 3rem);
+  background: rgba(18, 4, 11, 0.94);
+  border: 1px solid var(--gold-dark);
+  border-radius: var(--radius-md);
+  padding: 0.85rem;
+  color: var(--parchment);
+}
+
+.task-panel h3 {
+  font-family: var(--font-heading);
+  font-size: 0.95rem;
+  color: var(--gold);
+  margin-bottom: 0.5rem;
+}
+
 /* --------------------------------------------------------------------------
    20. Chat Panel (Collapsible)
    -------------------------------------------------------------------------- */
